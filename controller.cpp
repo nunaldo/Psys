@@ -35,7 +35,7 @@ SuperController::SuperController(uint8_t id,
                                  float d0)
     : my_id_(id),
       current_algo_(PRIMAL_DUAL),
-      feedback_enabled_(true),
+      feedback_enabled_(false),
       my_cost_(initial_cost),
       my_L_ref_(0.0f),
       gain_matrix_(gain_matrix),
@@ -46,9 +46,9 @@ SuperController::SuperController(uint8_t id,
       feedforward_u_(0.0f),
       feedback_u_(0.0f),
       final_u_(0.0f),
-      kp_(0.5f),
-      ki_(0.01f),
-      kd_(0.05f),
+      kp_(0.12f),
+      ki_(0.0015f),
+      kd_(0.0f),
       integral_error_(0.0f),
       last_error_(0.0f),
       my_lambda_(0.0f),
@@ -158,13 +158,13 @@ float SuperController::runControlCycle(const NeighborData& node_j,
                                        float measured_lux) {
     switch (current_algo_) {
         case PRIMAL_DUAL:
-            runPrimalDual(node_j, node_k);
+            runPrimalDual(node_j, node_k, measured_lux);
             break;
         case ADMM:
-            runADMM(node_j, node_k);
+            runADMM(node_j, node_k, measured_lux);
             break;
         case CONSENSUS:
-            runConsensus(node_j, node_k);
+            runConsensus(node_j, node_k, measured_lux);
             break;
     }
 
@@ -177,14 +177,21 @@ float SuperController::runControlCycle(const NeighborData& node_j,
             node_j.u,
             node_k.u,
             d0_i_);
-        const float error = expected_lux - measured_lux;
+        const float raw_error = expected_lux - measured_lux;
+        const float feedback_deadband = 0.20f;
+        float error = 0.0f;
+        if (raw_error > feedback_deadband) {
+            error = raw_error - feedback_deadband;
+        } else if (raw_error < -feedback_deadband) {
+            error = raw_error + feedback_deadband;
+        }
 
         integral_error_ += error;
-        if (integral_error_ > 50.0f) {
-            integral_error_ = 50.0f;
+        if (integral_error_ > 10.0f) {
+            integral_error_ = 10.0f;
         }
-        if (integral_error_ < -50.0f) {
-            integral_error_ = -50.0f;
+        if (integral_error_ < -10.0f) {
+            integral_error_ = -10.0f;
         }
 
         const float derivative = error - last_error_;
@@ -195,6 +202,10 @@ float SuperController::runControlCycle(const NeighborData& node_j,
     }
 
     final_u_ = clampUnit(feedforward_u_ + feedback_u_);
+    // The distributed optimizer must evolve around the duty that is actually
+    // applied and broadcast, otherwise each node optimizes one value while the
+    // network sees another and visible chatter appears.
+    feedforward_u_ = final_u_;
     return final_u_;
 }
 
@@ -256,10 +267,11 @@ void SuperController::resetOptimizationState() {
     consensus_initialized_ = false;
 }
 
-void SuperController::runPrimalDual(const NeighborData& node_j, const NeighborData& node_k) {
-    const float estimated_l = computeEstimatedLux(node_j, node_k);
-
-    my_lambda_ += alpha_ * (my_L_ref_ - estimated_l);
+void SuperController::runPrimalDual(const NeighborData& node_j,
+                                    const NeighborData& node_k,
+                                    float measured_lux) {
+    const float visibility_error = my_L_ref_ - measured_lux;
+    my_lambda_ += alpha_ * visibility_error;
     if (my_lambda_ < 0.0f) {
         my_lambda_ = 0.0f;
     }
@@ -271,7 +283,9 @@ void SuperController::runPrimalDual(const NeighborData& node_j, const NeighborDa
     feedforward_u_ = clampUnit(feedforward_u_ - (rho_ * gradient));
 }
 
-void SuperController::runADMM(const NeighborData& node_j, const NeighborData& node_k) {
+void SuperController::runADMM(const NeighborData& node_j,
+                              const NeighborData& node_k,
+                              float measured_lux) {
     // ADMM local model:
     // - keep the global decision u_i on this node
     // - keep local copies of the neighbors' duties
@@ -283,16 +297,8 @@ void SuperController::runADMM(const NeighborData& node_j, const NeighborData& no
         admm_initialized_ = true;
     }
 
-    const float estimated_l = computeExpectedLux(
-        selfGain(),
-        gainFromNeighborJ(),
-        gainFromNeighborK(),
-        feedforward_u_,
-        copy_u_j_,
-        copy_u_k_,
-        d0_i_);
-    const float lux_error = my_L_ref_ - estimated_l;
-    const float deadband = 0.35f;
+    const float lux_error = my_L_ref_ - measured_lux;
+    const float deadband = 0.75f;
 
     float under_error = 0.0f;
     float over_error = 0.0f;
@@ -312,7 +318,7 @@ void SuperController::runADMM(const NeighborData& node_j, const NeighborData& no
         gradient_copy_j -= penalty_scale * gainFromNeighborJ();
         gradient_copy_k -= penalty_scale * gainFromNeighborK();
     } else if (over_error > 0.0f) {
-        const float penalty_scale = 0.5f * admm_violation_gain_ * over_error;
+        const float penalty_scale = admm_violation_gain_ * over_error;
         gradient_u += penalty_scale * selfGain();
         gradient_copy_j += penalty_scale * gainFromNeighborJ();
         gradient_copy_k += penalty_scale * gainFromNeighborK();
@@ -344,11 +350,30 @@ void SuperController::runADMM(const NeighborData& node_j, const NeighborData& no
     }
 }
 
-void SuperController::runConsensus(const NeighborData& node_j, const NeighborData& node_k) {
-    const float estimated_l = computeEstimatedLux(node_j, node_k);
-    const float visibility_violation = positivePart(my_L_ref_ - estimated_l);
-    const float local_gradient =
-        my_cost_ - (consensus_penalty_gain_ * selfGain() * visibility_violation);
+void SuperController::runConsensus(const NeighborData& node_j,
+                                   const NeighborData& node_k,
+                                   float measured_lux) {
+    const float lux_error = my_L_ref_ - measured_lux;
+    const float deadband = 0.75f;
+
+    float under_error = 0.0f;
+    float over_error = 0.0f;
+    if (lux_error > deadband) {
+        under_error = lux_error - deadband;
+    } else if (lux_error < -deadband) {
+        over_error = (-lux_error) - deadband;
+    }
+
+    float local_gradient = my_cost_ + (0.02f * feedforward_u_);
+    if (under_error > 0.0f) {
+        local_gradient -= consensus_penalty_gain_ * selfGain() * under_error;
+    } else if (over_error > 0.0f) {
+        local_gradient += consensus_penalty_gain_ * selfGain() * over_error;
+    } else {
+        // Hold duty nearly constant when measured lux is already inside a small
+        // band around the target, otherwise consensus keeps drifting and flickers.
+        local_gradient = 0.0f;
+    }
 
     if (!consensus_initialized_) {
         my_gradient_estimate_ = local_gradient;
@@ -359,6 +384,12 @@ void SuperController::runConsensus(const NeighborData& node_j, const NeighborDat
             (consensus_neighbor_weight_ * node_j.auxiliary) +
             (consensus_neighbor_weight_ * node_k.auxiliary);
         my_gradient_estimate_ = mixed_estimate + (local_gradient - previous_local_gradient_);
+    }
+
+    if (my_gradient_estimate_ > 40.0f) {
+        my_gradient_estimate_ = 40.0f;
+    } else if (my_gradient_estimate_ < -40.0f) {
+        my_gradient_estimate_ = -40.0f;
     }
 
     previous_local_gradient_ = local_gradient;

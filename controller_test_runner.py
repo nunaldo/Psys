@@ -50,6 +50,13 @@ ALGO_NAMES = {
     2: "consensus",
 }
 
+PREFERRED_ALGO_ORDER = [1, 2, 0]
+ALGO_COLORS = {
+    0: "tab:green",
+    1: "tab:blue",
+    2: "tab:orange",
+}
+
 
 @dataclass
 class Sample:
@@ -70,18 +77,177 @@ class ScenarioConfig:
     feedback: int
     start_mode: int = 2
     distributed: bool = True
+    title: Optional[str] = None
 
 
 def algorithm_name(algo: int) -> str:
     return ALGO_NAMES.get(algo, f"algo_{algo}")
 
 
+def parse_algorithm_list(raw: str) -> List[int]:
+    reverse_names = {name.lower(): algo for algo, name in ALGO_NAMES.items()}
+    algos: List[int] = []
+    for item in [piece.strip() for piece in raw.split(",") if piece.strip()]:
+        lowered = item.lower()
+        if lowered in reverse_names:
+            algo = reverse_names[lowered]
+        else:
+            algo = int(item)
+            if algo not in ALGO_NAMES:
+                raise ValueError(f"Unknown algorithm id `{item}`")
+        if algo not in algos:
+            algos.append(algo)
+    if not algos:
+        raise ValueError("At least one algorithm must be selected")
+    return algos
+
+
+def scenario_key(algo: int, base_name: str, multi_algorithm: bool) -> str:
+    return f"{algorithm_name(algo)}_{base_name}" if multi_algorithm else base_name
+
+
+def build_scenario_configs(
+    algos: Sequence[int],
+    refs: List[float],
+    equal_costs: List[float],
+    weighted_costs: List[float],
+    feedback: int,
+) -> Dict[str, ScenarioConfig]:
+    multi_algorithm = len(algos) > 1
+    configs: Dict[str, ScenarioConfig] = {
+        "pid_baseline": ScenarioConfig(
+            name="pid_baseline",
+            title="pid_baseline",
+            algo=algos[0],
+            refs=refs,
+            costs=equal_costs,
+            feedback=feedback,
+            start_mode=1,
+            distributed=False,
+        )
+    }
+
+    for algo in algos:
+        equal_name = scenario_key(algo, "equal_cost", multi_algorithm)
+        weighted_name = scenario_key(algo, "weighted_cost", multi_algorithm)
+        configs[equal_name] = ScenarioConfig(
+            name=equal_name,
+            title="equal_cost",
+            algo=algo,
+            refs=refs,
+            costs=equal_costs,
+            feedback=feedback,
+        )
+        configs[weighted_name] = ScenarioConfig(
+            name=weighted_name,
+            title="weighted_cost",
+            algo=algo,
+            refs=refs,
+            costs=weighted_costs,
+            feedback=feedback,
+        )
+
+    return configs
+
+
+def infer_scenario_configs_from_names(
+    scenario_names: Sequence[str],
+    refs: List[float],
+    equal_costs: List[float],
+    weighted_costs: List[float],
+    feedback: int,
+    default_algo: int,
+) -> Dict[str, ScenarioConfig]:
+    configs: Dict[str, ScenarioConfig] = {}
+    reverse_names = {name.lower(): algo for algo, name in ALGO_NAMES.items()}
+
+    for scenario_name in scenario_names:
+        if scenario_name == "pid_baseline":
+            configs[scenario_name] = ScenarioConfig(
+                name="pid_baseline",
+                title="pid_baseline",
+                algo=default_algo,
+                refs=refs,
+                costs=equal_costs,
+                feedback=feedback,
+                start_mode=1,
+                distributed=False,
+            )
+            continue
+
+        matched_algo = default_algo
+        base_name = scenario_name
+        for algo_name, algo in reverse_names.items():
+            prefix = f"{algo_name}_"
+            if scenario_name.startswith(prefix):
+                matched_algo = algo
+                base_name = scenario_name[len(prefix):]
+                break
+
+        if base_name == "equal_cost":
+            costs = equal_costs
+        elif base_name == "weighted_cost":
+            costs = weighted_costs
+        else:
+            continue
+
+        configs[scenario_name] = ScenarioConfig(
+            name=scenario_name,
+            title=base_name,
+            algo=matched_algo,
+            refs=refs,
+            costs=costs,
+            feedback=feedback,
+        )
+
+    return configs
+
+
+def group_distributed_configs(
+    scenario_configs: Dict[str, ScenarioConfig],
+) -> Dict[int, Dict[str, ScenarioConfig]]:
+    grouped: Dict[int, Dict[str, ScenarioConfig]] = {}
+    for config in scenario_configs.values():
+        if not config.distributed:
+            continue
+        base_name = config.title or config.name
+        grouped.setdefault(config.algo, {})[base_name] = config
+    return grouped
+
+
 def scenario_display_name(config: Optional[ScenarioConfig]) -> str:
     if config is None:
         return "unknown"
+    base_name = config.title or config.name
     if not config.distributed or config.start_mode == 1:
-        return config.name
-    return f"{config.name} [{algorithm_name(config.algo)}]"
+        return base_name
+    return f"{base_name} [{algorithm_name(config.algo)}]"
+
+
+def ordered_algorithms(grouped_configs: Dict[int, Dict[str, ScenarioConfig]]) -> List[int]:
+    ordered = [algo for algo in PREFERRED_ALGO_ORDER if algo in grouped_configs]
+    ordered.extend(algo for algo in grouped_configs if algo not in ordered)
+    return ordered
+
+
+def select_available_distributed_configs(
+    records: Sequence[Sample],
+    scenario_configs: Dict[str, ScenarioConfig],
+) -> Dict[int, ScenarioConfig]:
+    available_names = set(unique_scenarios(records))
+    grouped = group_distributed_configs(scenario_configs)
+    selected: Dict[int, ScenarioConfig] = {}
+
+    for algo in ordered_algorithms(grouped):
+        configs = grouped[algo]
+        weighted_cfg = configs.get("weighted_cost")
+        equal_cfg = configs.get("equal_cost")
+        if weighted_cfg is not None and weighted_cfg.name in available_names:
+            selected[algo] = weighted_cfg
+        elif equal_cfg is not None and equal_cfg.name in available_names:
+            selected[algo] = equal_cfg
+
+    return selected
 
 
 def parse_csv_floats(raw: str, expected_len: int, label: str) -> List[float]:
@@ -165,8 +331,11 @@ def build_setup_commands(nodes: Sequence[int], config: ScenarioConfig) -> List[s
         if config.distributed:
             cmds.append(f"A {node} {config.algo}")
             cmds.append(f"C {node} {config.costs[idx]}")
+            cmds.append(f"U {node} {config.refs[idx]}")
+            cmds.append(f"O {node} {config.refs[idx]}")
+        else:
+            cmds.append(f"r {node} {config.refs[idx]}")
         cmds.append(f"f {node} {config.feedback}")
-        cmds.append(f"r {node} {config.refs[idx]}")
     for node in nodes:
         cmds.append(f"m {node} {config.start_mode}")
     return cmds
@@ -340,6 +509,67 @@ def scenario_summary(
     for idx, node in enumerate(nodes):
         per_node[node] = summarize_node(records, node, config_ref(config, idx))
     return per_node
+
+
+def sorted_samples(records: Sequence[Sample], node: int, metric: str) -> List[Sample]:
+    return sorted(samples_for(records, node, metric), key=lambda record: record.t_s)
+
+
+def integrate_time_series(records: Sequence[Sample]) -> float:
+    if len(records) < 2:
+        return 0.0
+    total = 0.0
+    prev = records[0]
+    for record in records[1:]:
+        dt = max(0.0, record.t_s - prev.t_s)
+        total += 0.5 * (prev.value + record.value) * dt
+        prev = record
+    return total
+
+
+def total_variation_rate(records: Sequence[Sample]) -> float:
+    if len(records) < 2:
+        return 0.0
+    variation = 0.0
+    for prev, record in zip(records, records[1:]):
+        variation += abs(record.value - prev.value)
+    duration = max(1e-9, records[-1].t_s - records[0].t_s)
+    return variation / duration
+
+
+def scenario_performance_metrics(
+    records: Sequence[Sample],
+    nodes: Sequence[int],
+    config: Optional[ScenarioConfig],
+    full_duty_watts: Optional[float],
+) -> Dict[str, float | str]:
+    duty_integral = 0.0
+    visibility_deficits: List[float] = []
+    flicker_rate = 0.0
+
+    for idx, node in enumerate(nodes):
+        duty_records = sorted_samples(records, node, "duty")
+        lux_records = sorted_samples(records, node, "lux")
+        duty_integral += integrate_time_series(duty_records)
+        flicker_rate += total_variation_rate(duty_records)
+
+        ref = config_ref(config, idx)
+        if not math.isnan(ref):
+            visibility_deficits.extend(max(0.0, ref - record.value) for record in lux_records)
+
+    if full_duty_watts is None:
+        energy_value = duty_integral
+        energy_label = "Energy Proxy [duty*s]"
+    else:
+        energy_value = duty_integral * full_duty_watts
+        energy_label = "Total Energy [J]"
+
+    return {
+        "energy_value": energy_value,
+        "energy_label": energy_label,
+        "visibility_error": statistics.fmean(visibility_deficits) if visibility_deficits else float("nan"),
+        "flicker_error": flicker_rate,
+    }
 
 
 def describe_node(node: int, cost: float, summary: Dict[str, float]) -> List[str]:
@@ -820,15 +1050,16 @@ def write_html_report(
             )
             for name in scenario_names
         }
+        scenario_labels = [scenario_display_name(scenario_configs.get(name)) for name in scenario_names]
         total_duty_svg = render_grouped_bar_chart_svg(
-            scenario_names,
+            scenario_labels,
             [("total duty", [sum(summaries[name][node]["duty_avg"] for node in nodes) for name in scenario_names], "#2563eb")],
             "Scenario comparison: total steady-state duty",
             "Duty sum",
             force_min=0.0,
         )
         total_deficit_svg = render_grouped_bar_chart_svg(
-            scenario_names,
+            scenario_labels,
             [("total deficit", [sum(summaries[name][node]["tail_avg_deficit"] for node in nodes) for name in scenario_names], "#dc2626")],
             "Scenario comparison: total steady-state deficit",
             "Lux deficit sum",
@@ -876,6 +1107,102 @@ def write_html_report(
             "</div>"
             "</section>"
         )
+
+    available_distributed = select_available_distributed_configs(records, scenario_configs)
+    if "pid_baseline" in scenario_names and available_distributed:
+        baseline_records = [record for record in records if record.scenario == "pid_baseline"]
+        baseline_metrics = scenario_performance_metrics(
+            baseline_records, nodes, scenario_configs.get("pid_baseline"), None
+        )
+        for distributed_cfg in available_distributed.values():
+            distributed_records = [record for record in records if record.scenario == distributed_cfg.name]
+            distributed_metrics = scenario_performance_metrics(
+                distributed_records, nodes, distributed_cfg, None
+            )
+            metric_categories = ["PID baseline", scenario_display_name(distributed_cfg)]
+            energy_svg = render_grouped_bar_chart_svg(
+                metric_categories,
+                [("energy proxy", [baseline_metrics["energy_value"], distributed_metrics["energy_value"]], "#2563eb")],
+                f"Performance metric: energy vs {scenario_display_name(distributed_cfg)}",
+                "Duty*s",
+                force_min=0.0,
+            )
+            visibility_svg = render_grouped_bar_chart_svg(
+                metric_categories,
+                [("visibility error", [baseline_metrics["visibility_error"], distributed_metrics["visibility_error"]], "#dc2626")],
+                f"Performance metric: visibility vs {scenario_display_name(distributed_cfg)}",
+                "Lux",
+                force_min=0.0,
+            )
+            flicker_svg = render_grouped_bar_chart_svg(
+                metric_categories,
+                [("flicker error", [baseline_metrics["flicker_error"], distributed_metrics["flicker_error"]], "#059669")],
+                f"Performance metric: flicker vs {scenario_display_name(distributed_cfg)}",
+                "1/s",
+                force_min=0.0,
+            )
+            sections.append(
+                "<section>"
+                f"<h2>Performance Comparison: {escape(scenario_display_name(distributed_cfg))}</h2>"
+                "<p>Energy is shown as a duty-time proxy unless a real full-duty power constant is provided to the PNG workflow.</p>"
+                '<div class="grid">'
+                f'<div class="card">{energy_svg}</div>'
+                f'<div class="card">{visibility_svg}</div>'
+                f'<div class="card">{flicker_svg}</div>'
+                "</div>"
+                "</section>"
+            )
+
+    if len(available_distributed) >= 2:
+        distributed_labels = [scenario_display_name(config) for config in available_distributed.values()]
+        distributed_metrics = [
+            scenario_performance_metrics(
+                [record for record in records if record.scenario == config.name],
+                nodes,
+                config,
+                None,
+            )
+            for config in available_distributed.values()
+        ]
+        energy_svg = render_grouped_bar_chart_svg(
+            distributed_labels,
+            [("energy proxy", [float(metrics["energy_value"]) for metrics in distributed_metrics], "#2563eb")],
+            "Distributed algorithm comparison: energy proxy",
+            "Duty*s",
+            force_min=0.0,
+        )
+        visibility_svg = render_grouped_bar_chart_svg(
+            distributed_labels,
+            [("visibility error", [float(metrics["visibility_error"]) for metrics in distributed_metrics], "#dc2626")],
+            "Distributed algorithm comparison: visibility error",
+            "Lux",
+            force_min=0.0,
+        )
+        flicker_svg = render_grouped_bar_chart_svg(
+            distributed_labels,
+            [("flicker error", [float(metrics["flicker_error"]) for metrics in distributed_metrics], "#059669")],
+            "Distributed algorithm comparison: flicker error",
+            "1/s",
+            force_min=0.0,
+        )
+        sections.append(
+            "<section>"
+            "<h2>Distributed Algorithm Comparison</h2>"
+            "<p>Each bar uses the preferred distributed scenario per algorithm: weighted-cost when available, otherwise equal-cost.</p>"
+            '<div class="grid">'
+            f'<div class="card">{energy_svg}</div>'
+            f'<div class="card">{visibility_svg}</div>'
+            f'<div class="card">{flicker_svg}</div>'
+            "</div>"
+            "</section>"
+        )
+
+    sections.append(
+        "<section>"
+        "<h2>Missing Internal Plots</h2>"
+        "<p>The current CSV stores illuminance and duty only. Consensus variables, dual variables, and calibration-sequence traces need explicit firmware logging before they can be plotted faithfully.</p>"
+        "</section>"
+    )
 
     html = (
         "<!doctype html><html><head><meta charset=\"utf-8\">"
@@ -1075,16 +1402,262 @@ def save_comparison_plot(
     plt.close(fig)
 
 
+def save_cooperative_intelligence_plot(
+    plt,
+    records: Sequence[Sample],
+    nodes: Sequence[int],
+    config: Optional[ScenarioConfig],
+    path: Path,
+) -> None:
+    fig, (ax_lux, ax_duty) = plt.subplots(2, 1, figsize=(14, 8), sharex=True, constrained_layout=True)
+    title = scenario_display_name(config) if config is not None else "weighted_cost"
+    cost_text = ""
+    if config is not None:
+        cost_text = " | costs=" + ",".join(f"{cost:.2f}" for cost in config.costs)
+    fig.suptitle(f"Cooperative intelligence: {title}{cost_text}", fontsize=14)
+
+    refs = [config_ref(config, idx) for idx, _ in enumerate(nodes)]
+    ref_max = max((ref for ref in refs if not math.isnan(ref)), default=1.0)
+
+    for idx, node in enumerate(nodes):
+        color = NODE_COLORS.get(node, f"C{idx}")
+        lux_records = sorted_samples(records, node, "lux")
+        duty_records = sorted_samples(records, node, "duty")
+        if lux_records:
+            ax_lux.plot(
+                [record.t_s for record in lux_records],
+                [record.value for record in lux_records],
+                marker="o",
+                markersize=3,
+                linewidth=2.0,
+                color=color,
+                label=f"y{node}",
+            )
+        if duty_records:
+            ax_duty.plot(
+                [record.t_s for record in duty_records],
+                [record.value for record in duty_records],
+                marker="o",
+                markersize=3,
+                linewidth=2.0,
+                color=color,
+                label=f"u{node}",
+            )
+
+    ax_lux.set_title("Measured illuminance")
+    ax_lux.set_ylabel("Lux")
+    ax_lux.set_ylim(0.0, max(1.0, ref_max))
+    ax_lux.grid(True, alpha=0.25)
+    ax_lux.legend(ncols=min(3, len(nodes)))
+    for idx, node in enumerate(nodes):
+        ref = config_ref(config, idx)
+        if not math.isnan(ref):
+            ax_lux.axhline(ref, color=NODE_COLORS.get(node, f"C{idx}"), linestyle="--", linewidth=1.0, alpha=0.35)
+
+    ax_duty.set_title("Control signals")
+    ax_duty.set_xlabel("Time [s]")
+    ax_duty.set_ylabel("Duty")
+    ax_duty.set_ylim(0.0, 1.05)
+    ax_duty.grid(True, alpha=0.25)
+    ax_duty.legend(ncols=min(3, len(nodes)))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def save_performance_metrics_plot(
+    plt,
+    records: Sequence[Sample],
+    nodes: Sequence[int],
+    scenario_configs: Dict[str, ScenarioConfig],
+    path: Path,
+    *,
+    distributed_scenario: str,
+    full_duty_watts: Optional[float],
+) -> None:
+    baseline_records = [record for record in records if record.scenario == "pid_baseline"]
+    distributed_records = [record for record in records if record.scenario == distributed_scenario]
+    if not baseline_records or not distributed_records:
+        return
+
+    distributed_config = scenario_configs.get(distributed_scenario)
+    baseline_metrics = scenario_performance_metrics(
+        baseline_records, nodes, scenario_configs.get("pid_baseline"), full_duty_watts
+    )
+    distributed_metrics = scenario_performance_metrics(
+        distributed_records, nodes, distributed_config, full_duty_watts
+    )
+
+    distributed_label = scenario_display_name(distributed_config)
+    labels = ["PID baseline", distributed_label]
+    energy_label = str(baseline_metrics["energy_label"])
+    metrics = [
+        ("energy_value", energy_label, "#2563eb"),
+        ("visibility_error", "Visibility Error [lux]", "#dc2626"),
+        ("flicker_error", "Flicker Error [1/s]", "#059669"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), constrained_layout=True)
+    fig.suptitle(f"Performance metric comparison: local PID vs {distributed_label}", fontsize=14)
+
+    for ax, (metric_key, axis_title, color) in zip(axes, metrics):
+        values = [float(baseline_metrics[metric_key]), float(distributed_metrics[metric_key])]
+        ax.bar(labels, values, color=[color, color], alpha=0.8)
+        ax.set_title(axis_title)
+        ax.grid(True, axis="y", alpha=0.25)
+        for idx, value in enumerate(values):
+            ax.text(idx, value, fmt_float(value, 3), ha="center", va="bottom", fontsize=9)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def save_pid_vs_admm_plot(
+    plt,
+    records: Sequence[Sample],
+    nodes: Sequence[int],
+    scenario_configs: Dict[str, ScenarioConfig],
+    path: Path,
+    *,
+    distributed_scenario: str,
+) -> None:
+    baseline_records = [record for record in records if record.scenario == "pid_baseline"]
+    distributed_records = [record for record in records if record.scenario == distributed_scenario]
+    if not baseline_records or not distributed_records:
+        return
+
+    distributed_config = scenario_configs.get(distributed_scenario)
+    distributed_label = scenario_display_name(distributed_config)
+    fig, (ax_lux, ax_duty) = plt.subplots(2, 1, figsize=(14, 8), sharex=True, constrained_layout=True)
+    fig.suptitle(f"{distributed_label} vs PID baseline", fontsize=14)
+    refs = [config_ref(distributed_config, idx) for idx, _ in enumerate(nodes)]
+    ref_max = max((ref for ref in refs if not math.isnan(ref)), default=1.0)
+
+    for idx, node in enumerate(nodes):
+        color = NODE_COLORS.get(node, f"C{idx}")
+        base_lux = sorted_samples(baseline_records, node, "lux")
+        dist_lux = sorted_samples(distributed_records, node, "lux")
+        base_duty = sorted_samples(baseline_records, node, "duty")
+        dist_duty = sorted_samples(distributed_records, node, "duty")
+
+        if base_lux:
+            ax_lux.plot(
+                [record.t_s for record in base_lux],
+                [record.value for record in base_lux],
+                linestyle="--",
+                linewidth=1.5,
+                color=color,
+                alpha=0.6,
+                label=f"PID y{node}",
+            )
+        if dist_lux:
+            ax_lux.plot(
+                [record.t_s for record in dist_lux],
+                [record.value for record in dist_lux],
+                linewidth=2.0,
+                color=color,
+                label=f"{distributed_label} y{node}",
+            )
+        if base_duty:
+            ax_duty.plot(
+                [record.t_s for record in base_duty],
+                [record.value for record in base_duty],
+                linestyle="--",
+                linewidth=1.5,
+                color=color,
+                alpha=0.6,
+                label=f"PID u{node}",
+            )
+        if dist_duty:
+            ax_duty.plot(
+                [record.t_s for record in dist_duty],
+                [record.value for record in dist_duty],
+                linewidth=2.0,
+                color=color,
+                label=f"{distributed_label} u{node}",
+            )
+
+    ax_lux.set_title("Measured illuminance")
+    ax_lux.set_ylabel("Lux")
+    ax_lux.set_ylim(0.0, max(1.0, ref_max))
+    ax_lux.grid(True, alpha=0.25)
+    ax_lux.legend(ncols=3, fontsize=9)
+
+    ax_duty.set_title("Duty command")
+    ax_duty.set_xlabel("Time [s]")
+    ax_duty.set_ylabel("Duty")
+    ax_duty.set_ylim(0.0, 1.05)
+    ax_duty.grid(True, alpha=0.25)
+    ax_duty.legend(ncols=3, fontsize=9)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def save_algorithm_comparison_plot(
+    plt,
+    records: Sequence[Sample],
+    nodes: Sequence[int],
+    scenario_configs: Dict[str, ScenarioConfig],
+    path: Path,
+    *,
+    full_duty_watts: Optional[float],
+) -> None:
+    selected = select_available_distributed_configs(records, scenario_configs)
+    if len(selected) < 2:
+        return
+
+    configs = list(selected.values())
+    labels = [scenario_display_name(config) for config in configs]
+    metrics = [
+        scenario_performance_metrics(
+            [record for record in records if record.scenario == config.name],
+            nodes,
+            config,
+            full_duty_watts,
+        )
+        for config in configs
+    ]
+    colors = [ALGO_COLORS.get(config.algo, f"C{idx}") for idx, config in enumerate(configs)]
+    energy_label = str(metrics[0]["energy_label"])
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), constrained_layout=True)
+    fig.suptitle("Distributed algorithm comparison", fontsize=14)
+    metric_specs = [
+        ("energy_value", energy_label),
+        ("visibility_error", "Visibility Error [lux]"),
+        ("flicker_error", "Flicker Error [1/s]"),
+    ]
+
+    for ax, (metric_key, title) in zip(axes, metric_specs):
+        values = [float(metric[metric_key]) for metric in metrics]
+        ax.bar(labels, values, color=colors, alpha=0.82)
+        ax.set_title(title)
+        ax.grid(True, axis="y", alpha=0.25)
+        for idx, value in enumerate(values):
+            ax.text(idx, value, fmt_float(value, 3), ha="center", va="bottom", fontsize=9)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def write_plots(
     records: Sequence[Sample],
     nodes: Sequence[int],
     scenario_configs: Dict[str, ScenarioConfig],
     out_dir: Path,
     prefix: str,
+    *,
+    full_duty_watts: Optional[float],
 ) -> List[Path]:
     if not records:
         return []
 
+    scenario_names = unique_scenarios(records)
     plt = try_load_matplotlib()
     if plt is None:
         report_path = out_dir / f"{prefix}_report.html"
@@ -1092,7 +1665,7 @@ def write_plots(
         return [report_path]
 
     plot_paths: List[Path] = []
-    for scenario_name in unique_scenarios(records):
+    for scenario_name in scenario_names:
         scenario_records = [record for record in records if record.scenario == scenario_name]
         if not scenario_records:
             continue
@@ -1100,10 +1673,73 @@ def write_plots(
         save_scenario_plot(plt, scenario_records, nodes, scenario_configs.get(scenario_name), path)
         plot_paths.append(path)
 
-    if len(unique_scenarios(records)) >= 2:
+    if len(scenario_names) >= 2:
         comparison_path = out_dir / f"{prefix}_comparison.png"
         save_comparison_plot(plt, records, nodes, scenario_configs, comparison_path)
         plot_paths.append(comparison_path)
+
+    selected_distributed = select_available_distributed_configs(records, scenario_configs)
+    single_distributed = len(selected_distributed) <= 1
+
+    for config in selected_distributed.values():
+        if config.title == "weighted_cost" and config.name in scenario_names:
+            if single_distributed:
+                cooperative_path = out_dir / f"{prefix}_cooperative_intelligence.png"
+            else:
+                cooperative_path = out_dir / f"{prefix}_{config.name}_cooperative_intelligence.png"
+            weighted_records = [record for record in records if record.scenario == config.name]
+            save_cooperative_intelligence_plot(
+                plt,
+                weighted_records,
+                nodes,
+                config,
+                cooperative_path,
+            )
+            plot_paths.append(cooperative_path)
+
+        if "pid_baseline" in scenario_names and config.name in scenario_names:
+            if single_distributed:
+                performance_path = out_dir / f"{prefix}_performance_metrics.png"
+            else:
+                performance_path = out_dir / f"{prefix}_{config.name}_performance_metrics.png"
+            save_performance_metrics_plot(
+                plt,
+                records,
+                nodes,
+                scenario_configs,
+                performance_path,
+                distributed_scenario=config.name,
+                full_duty_watts=full_duty_watts,
+            )
+            plot_paths.append(performance_path)
+
+            if single_distributed and config.algo == 1:
+                pid_vs_path = out_dir / f"{prefix}_pid_vs_admm.png"
+            elif single_distributed:
+                pid_vs_path = out_dir / f"{prefix}_pid_vs_distributed.png"
+            else:
+                pid_vs_path = out_dir / f"{prefix}_{config.name}_pid_vs_baseline.png"
+            save_pid_vs_admm_plot(
+                plt,
+                records,
+                nodes,
+                scenario_configs,
+                pid_vs_path,
+                distributed_scenario=config.name,
+            )
+            plot_paths.append(pid_vs_path)
+
+    if len(selected_distributed) >= 2:
+        algorithm_comparison_path = out_dir / f"{prefix}_distributed_algorithm_comparison.png"
+        save_algorithm_comparison_plot(
+            plt,
+            records,
+            nodes,
+            scenario_configs,
+            algorithm_comparison_path,
+            full_duty_watts=full_duty_watts,
+        )
+        plot_paths.append(algorithm_comparison_path)
 
     return plot_paths
 
@@ -1152,10 +1788,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--timeout", type=float, default=0.2)
     parser.add_argument("--algo", type=int, default=1, choices=[0, 1, 2], help="0=PRIMAL_DUAL, 1=ADMM, 2=CONSENSUS")
-    parser.add_argument("--feedback", type=int, default=1, choices=[0, 1])
-    parser.add_argument("--refs", default="20.0,20.0,20.0", help="Comma-separated refs for nodes 1..N")
+    parser.add_argument(
+        "--algos",
+        default="",
+        help="Comma-separated distributed algorithms to run in one pass, e.g. 1,2,0 or admm,consensus,primal_dual",
+    )
+    parser.add_argument(
+        "--feedback",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Distributed local feedback overlay: 0=off, 1=on. Default off because it can destabilize distributed tests.",
+    )
+    parser.add_argument("--refs", default="30.0,30.0,30.0", help="Comma-separated refs for nodes 1..N")
     parser.add_argument("--equal-costs", default="1,1,1", help="Comma-separated costs for equal-cost scenario")
-    parser.add_argument("--weighted-costs", default="1,3,8", help="Comma-separated costs for weighted scenario")
+    parser.add_argument(
+        "--weighted-costs",
+        default="11,0.5,13",
+        help="Comma-separated costs for weighted scenario",
+    )
+    parser.add_argument(
+        "--full-duty-watts",
+        type=float,
+        default=None,
+        help="Optional full-duty LED power to convert duty integral into Joules for the performance plot.",
+    )
     parser.add_argument("--monitor-seconds", type=float, default=15.0)
     parser.add_argument("--sample-period", type=float, default=0.6)
     parser.add_argument("--reply-window", type=float, default=0.30)
@@ -1182,46 +1839,27 @@ def main() -> None:
     refs = parse_csv_floats(args.refs, 3, "refs")
     equal_costs = parse_csv_floats(args.equal_costs, 3, "equal-costs")
     weighted_costs = parse_csv_floats(args.weighted_costs, 3, "weighted-costs")
-
-    equal_cfg = ScenarioConfig(
-        name="equal_cost",
-        algo=args.algo,
-        refs=refs,
-        costs=equal_costs,
-        feedback=args.feedback,
+    algos = parse_algorithm_list(args.algos) if args.algos.strip() else [args.algo]
+    scenario_configs = build_scenario_configs(
+        algos,
+        refs,
+        equal_costs,
+        weighted_costs,
+        args.feedback,
     )
-    weighted_cfg = ScenarioConfig(
-        name="weighted_cost",
-        algo=args.algo,
-        refs=refs,
-        costs=weighted_costs,
-        feedback=args.feedback,
-    )
-    baseline_cfg = ScenarioConfig(
-        name="pid_baseline",
-        algo=args.algo,
-        refs=refs,
-        costs=equal_costs,
-        feedback=args.feedback,
-        start_mode=1,
-        distributed=False,
-    )
+    baseline_cfg = scenario_configs["pid_baseline"]
 
     out_dir = Path(args.out_dir)
     prefix = args.prefix.strip()
     if args.plot_csv:
         prefix = prefix or Path(args.plot_csv).stem
     else:
-        prefix = prefix or datetime.now().strftime(
-            f"controller_test_%Y%m%d_%H%M%S_{algorithm_name(args.algo)}"
-        )
+        if len(algos) == 1:
+            algo_tag = algorithm_name(algos[0])
+        else:
+            algo_tag = "multi_" + "_".join(algorithm_name(algo) for algo in algos)
+        prefix = prefix or datetime.now().strftime(f"controller_test_%Y%m%d_%H%M%S_{algo_tag}")
     csv_path = out_dir / f"{prefix}.csv"
-
-    scenario_configs = {
-        baseline_cfg.name: baseline_cfg,
-        equal_cfg.name: equal_cfg,
-        weighted_cfg.name: weighted_cfg,
-    }
 
     all_records: List[Sample] = []
     scenario_summaries: Dict[str, Dict[int, Dict[str, float]]] = {}
@@ -1230,10 +1868,21 @@ def main() -> None:
         all_records = load_csv_records(Path(args.plot_csv))
         if not all_records:
             raise SystemExit(f"No samples found in {args.plot_csv}")
+        scenario_names = unique_scenarios(all_records)
+        scenario_configs = infer_scenario_configs_from_names(
+            scenario_names,
+            refs,
+            equal_costs,
+            weighted_costs,
+            args.feedback,
+            algos[0],
+        )
+        if "pid_baseline" not in scenario_configs:
+            scenario_configs["pid_baseline"] = baseline_cfg
         nodes = sorted({record.node for record in all_records})
         print(f"Loaded {len(all_records)} samples from {args.plot_csv}")
         print(f"Nodes in CSV: {nodes}")
-        for scenario_name in unique_scenarios(all_records):
+        for scenario_name in scenario_names:
             config = scenario_configs.get(scenario_name)
             if config is None:
                 print(f"Skipping text analysis for unknown scenario `{scenario_name}`.")
@@ -1247,7 +1896,7 @@ def main() -> None:
             ) from SERIAL_IMPORT_ERROR
 
         print(f"Opening {args.port} @ {args.baud}...")
-        print(f"Distributed algorithm: {algorithm_name(args.algo)}")
+        print("Distributed algorithms: " + ", ".join(algorithm_name(algo) for algo in algos))
         with serial.Serial(args.port, args.baud, timeout=args.timeout) as ser:
             time.sleep(1.0)
             nodes = discover_nodes(ser, args.reply_window)
@@ -1279,72 +1928,85 @@ def main() -> None:
                 baseline_summary = analyze_scenario(baseline_records, nodes, baseline_cfg)
                 scenario_summaries[baseline_cfg.name] = baseline_summary
 
-            run_setup(ser, nodes, equal_cfg, args.delay, args.reply_window)
-            print(f"\n== Settling {args.settle_seconds:.1f}s ==")
-            time.sleep(args.settle_seconds)
-            equal_records = collect_samples(
-                ser,
-                nodes,
-                equal_cfg,
-                args.monitor_seconds,
-                args.sample_period,
-                args.reply_window,
-            )
-            all_records.extend(equal_records)
-            equal_summary = analyze_scenario(equal_records, nodes, equal_cfg)
-            scenario_summaries[equal_cfg.name] = equal_summary
-            if baseline_summary is not None:
-                compare_to_baseline(nodes, baseline_cfg, baseline_summary, equal_cfg, equal_summary)
+            grouped_configs = group_distributed_configs(scenario_configs)
+            for algo in ordered_algorithms(grouped_configs):
+                configs = grouped_configs[algo]
+                equal_cfg = configs.get("equal_cost")
+                weighted_cfg = configs.get("weighted_cost")
 
-            if not args.skip_weighted:
-                run_setup(ser, nodes, weighted_cfg, args.delay, args.reply_window)
-                print(f"\n== Settling {args.settle_seconds:.1f}s ==")
-                time.sleep(args.settle_seconds)
-                weighted_records = collect_samples(
-                    ser,
-                    nodes,
-                    weighted_cfg,
-                    args.monitor_seconds,
-                    args.sample_period,
-                    args.reply_window,
-                )
-                all_records.extend(weighted_records)
-                weighted_summary = analyze_scenario(weighted_records, nodes, weighted_cfg)
-                scenario_summaries[weighted_cfg.name] = weighted_summary
-                if baseline_summary is not None:
-                    compare_to_baseline(nodes, baseline_cfg, baseline_summary, weighted_cfg, weighted_summary)
-                compare_scenarios(nodes, equal_cfg, equal_summary, weighted_cfg, weighted_summary)
+                if equal_cfg is not None:
+                    run_setup(ser, nodes, equal_cfg, args.delay, args.reply_window)
+                    print(f"\n== Settling {args.settle_seconds:.1f}s ==")
+                    time.sleep(args.settle_seconds)
+                    equal_records = collect_samples(
+                        ser,
+                        nodes,
+                        equal_cfg,
+                        args.monitor_seconds,
+                        args.sample_period,
+                        args.reply_window,
+                    )
+                    all_records.extend(equal_records)
+                    equal_summary = analyze_scenario(equal_records, nodes, equal_cfg)
+                    scenario_summaries[equal_cfg.name] = equal_summary
+                    if baseline_summary is not None:
+                        compare_to_baseline(nodes, baseline_cfg, baseline_summary, equal_cfg, equal_summary)
+
+                if weighted_cfg is not None and not args.skip_weighted:
+                    run_setup(ser, nodes, weighted_cfg, args.delay, args.reply_window)
+                    print(f"\n== Settling {args.settle_seconds:.1f}s ==")
+                    time.sleep(args.settle_seconds)
+                    weighted_records = collect_samples(
+                        ser,
+                        nodes,
+                        weighted_cfg,
+                        args.monitor_seconds,
+                        args.sample_period,
+                        args.reply_window,
+                    )
+                    all_records.extend(weighted_records)
+                    weighted_summary = analyze_scenario(weighted_records, nodes, weighted_cfg)
+                    scenario_summaries[weighted_cfg.name] = weighted_summary
+                    if baseline_summary is not None:
+                        compare_to_baseline(nodes, baseline_cfg, baseline_summary, weighted_cfg, weighted_summary)
+                    if equal_cfg is not None and equal_cfg.name in scenario_summaries:
+                        compare_scenarios(
+                            nodes,
+                            equal_cfg,
+                            scenario_summaries[equal_cfg.name],
+                            weighted_cfg,
+                            weighted_summary,
+                        )
 
         write_csv(all_records, csv_path)
         print(f"\nSaved CSV: {csv_path}")
 
-    if "pid_baseline" in scenario_summaries and "equal_cost" in scenario_summaries and args.plot_csv:
-        compare_to_baseline(
-            nodes,
-            baseline_cfg,
-            scenario_summaries["pid_baseline"],
-            equal_cfg,
-            scenario_summaries["equal_cost"],
-        )
-    if "pid_baseline" in scenario_summaries and "weighted_cost" in scenario_summaries and args.plot_csv:
-        compare_to_baseline(
-            nodes,
-            baseline_cfg,
-            scenario_summaries["pid_baseline"],
-            weighted_cfg,
-            scenario_summaries["weighted_cost"],
-        )
-    if "equal_cost" in scenario_summaries and "weighted_cost" in scenario_summaries and args.plot_csv:
-        compare_scenarios(
-            nodes,
-            equal_cfg,
-            scenario_summaries["equal_cost"],
-            weighted_cfg,
-            scenario_summaries["weighted_cost"],
-        )
+    if args.plot_csv:
+        grouped_configs = group_distributed_configs(scenario_configs)
+        for algo in ordered_algorithms(grouped_configs):
+            configs = grouped_configs[algo]
+            equal_cfg = configs.get("equal_cost")
+            weighted_cfg = configs.get("weighted_cost")
+            baseline_summary = scenario_summaries.get("pid_baseline")
+            equal_summary = scenario_summaries.get(equal_cfg.name) if equal_cfg is not None else None
+            weighted_summary = scenario_summaries.get(weighted_cfg.name) if weighted_cfg is not None else None
+
+            if baseline_summary is not None and equal_cfg is not None and equal_summary is not None:
+                compare_to_baseline(nodes, baseline_cfg, baseline_summary, equal_cfg, equal_summary)
+            if baseline_summary is not None and weighted_cfg is not None and weighted_summary is not None:
+                compare_to_baseline(nodes, baseline_cfg, baseline_summary, weighted_cfg, weighted_summary)
+            if equal_cfg is not None and equal_summary is not None and weighted_cfg is not None and weighted_summary is not None:
+                compare_scenarios(nodes, equal_cfg, equal_summary, weighted_cfg, weighted_summary)
 
     if not args.no_plots:
-        plot_paths = write_plots(all_records, nodes, scenario_configs, out_dir, prefix)
+        plot_paths = write_plots(
+            all_records,
+            nodes,
+            scenario_configs,
+            out_dir,
+            prefix,
+            full_duty_watts=args.full_duty_watts,
+        )
         for path in plot_paths:
             print(f"Saved plot: {path}")
 
@@ -1353,12 +2015,14 @@ def main() -> None:
         print("- These results include a fresh calibration taken immediately before the test.")
     print("- Lux values close to each node reference, especially in the last 40% of samples.")
     print("- Duty not stuck at 1.0 all the time; otherwise the test is saturated.")
-    if args.algo == 1:
+    if 1 in algos:
         print("- With ADMM, the duties should settle instead of jumping violently between samples.")
         print("- With weighted costs, expensive nodes should tend to back off if the calibrated model is sane.")
-    else:
+    if any(algo != 1 for algo in algos):
         print("- With equal costs, stronger nodes may naturally carry more load.")
         print("- With weighted costs, expensive nodes should tend to reduce duty if the target is achievable.")
+    if len(algos) > 1:
+        print("- Compare the distributed-algorithm comparison plot to see which method reduces energy and flicker best.")
 
 
 if __name__ == "__main__":

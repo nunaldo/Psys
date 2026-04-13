@@ -98,9 +98,9 @@ private:
     float computeEstimatedLux(const NeighborData& node_j,
                               const NeighborData& node_k) const;
     void resetOptimizationState();
-    void runPrimalDual(const NeighborData& node_j, const NeighborData& node_k);
-    void runADMM(const NeighborData& node_j, const NeighborData& node_k);
-    void runConsensus(const NeighborData& node_j, const NeighborData& node_k);
+    void runPrimalDual(const NeighborData& node_j, const NeighborData& node_k, float measured_lux);
+    void runADMM(const NeighborData& node_j, const NeighborData& node_k, float measured_lux);
+    void runConsensus(const NeighborData& node_j, const NeighborData& node_k, float measured_lux);
 };
 
 #endif
