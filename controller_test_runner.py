@@ -44,6 +44,12 @@ NODE_COLORS = {
     3: "tab:green",
 }
 
+ALGO_NAMES = {
+    0: "primal_dual",
+    1: "admm",
+    2: "consensus",
+}
+
 
 @dataclass
 class Sample:
@@ -64,6 +70,18 @@ class ScenarioConfig:
     feedback: int
     start_mode: int = 2
     distributed: bool = True
+
+
+def algorithm_name(algo: int) -> str:
+    return ALGO_NAMES.get(algo, f"algo_{algo}")
+
+
+def scenario_display_name(config: Optional[ScenarioConfig]) -> str:
+    if config is None:
+        return "unknown"
+    if not config.distributed or config.start_mode == 1:
+        return config.name
+    return f"{config.name} [{algorithm_name(config.algo)}]"
 
 
 def parse_csv_floats(raw: str, expected_len: int, label: str) -> List[float]:
@@ -161,10 +179,24 @@ def run_setup(
     delay_s: float,
     reply_window_s: float,
 ) -> None:
-    print(f"\n== Setup: {config.name} ==")
+    print(f"\n== Setup: {scenario_display_name(config)} ==")
     for cmd in build_setup_commands(nodes, config):
         send_command(ser, cmd, reply_window_s)
         time.sleep(delay_s)
+
+
+def run_calibration(
+    ser: "serial.Serial",
+    calibration_seconds: float,
+    reply_window_s: float,
+    delay_s: float,
+) -> None:
+    print("\n== Calibration ==")
+    send_command(ser, "cal", reply_window_s=max(reply_window_s, 0.5))
+    print(f"\n== Waiting {calibration_seconds:.1f}s for calibration FSM ==")
+    time.sleep(calibration_seconds)
+    send_command(ser, "p 0 0", reply_window_s=max(reply_window_s, 1.0))
+    time.sleep(delay_s)
 
 
 def collect_samples(
@@ -175,7 +207,7 @@ def collect_samples(
     sample_period_s: float,
     reply_window_s: float,
 ) -> List[Sample]:
-    print(f"\n== Monitor: {config.name} for {duration_s:.1f}s ==")
+    print(f"\n== Monitor: {scenario_display_name(config)} for {duration_s:.1f}s ==")
     start = time.time()
     records: List[Sample] = []
 
@@ -339,7 +371,7 @@ def analyze_scenario(
     nodes: Sequence[int],
     config: ScenarioConfig,
 ) -> Dict[int, Dict[str, float]]:
-    print(f"\n== Analysis: {config.name} ==")
+    print(f"\n== Analysis: {scenario_display_name(config)} ==")
     per_node: Dict[int, Dict[str, float]] = {}
     for idx, node in enumerate(nodes):
         summary = summarize_node(records, node, config.refs[idx])
@@ -743,23 +775,24 @@ def write_html_report(
     for scenario_name in scenario_names:
         scenario_records = [record for record in records if record.scenario == scenario_name]
         config = scenario_configs.get(scenario_name)
+        display_name = scenario_display_name(config)
         summary = scenario_summary(scenario_records, nodes, config)
-        lux_svg = render_line_chart_svg(scenario_records, nodes, config, "lux", f"{scenario_name}: lux tracking")
-        duty_svg = render_line_chart_svg(scenario_records, nodes, config, "duty", f"{scenario_name}: duty command")
+        lux_svg = render_line_chart_svg(scenario_records, nodes, config, "lux", f"{display_name}: lux tracking")
+        duty_svg = render_line_chart_svg(scenario_records, nodes, config, "duty", f"{display_name}: duty command")
         steady_lux_svg = render_grouped_bar_chart_svg(
             [f"Node {node}" for node in nodes],
             [
                 ("steady lux", [summary[node]["lux_avg"] for node in nodes], "#2563eb"),
                 ("reference", [config_ref(config, idx) for idx, _ in enumerate(nodes)], "#111827"),
             ],
-            f"{scenario_name}: steady-state lux",
+            f"{display_name}: steady-state lux",
             "Lux",
             force_min=0.0,
         )
         steady_duty_svg = render_grouped_bar_chart_svg(
             [f"Node {node}" for node in nodes],
             [("steady duty", [summary[node]["duty_avg"] for node in nodes], "#059669")],
-            f"{scenario_name}: steady-state duty",
+            f"{display_name}: steady-state duty",
             "Duty",
             force_min=0.0,
             force_max=1.0,
@@ -767,7 +800,7 @@ def write_html_report(
 
         sections.append(
             "<section>"
-            f"<h2>{escape(scenario_name)}</h2>"
+            f"<h2>{escape(display_name)}</h2>"
             f"{scenario_table_html(nodes, config, summary)}"
             '<div class="grid">'
             f'<div class="card">{lux_svg}</div>'
@@ -803,7 +836,7 @@ def write_html_report(
         )
         node_duty_series = [
             (
-                name,
+                scenario_display_name(scenario_configs.get(name)),
                 [summaries[name][node]["duty_avg"] for node in nodes],
                 f"hsl({(idx * 110) % 360} 65% 45%)",
             )
@@ -811,7 +844,7 @@ def write_html_report(
         ]
         node_error_series = [
             (
-                name,
+                scenario_display_name(scenario_configs.get(name)),
                 [summaries[name][node]["lux_avg"] - summaries[name][node]["ref"] for node in nodes],
                 f"hsl({(idx * 110) % 360} 65% 45%)",
             )
@@ -877,7 +910,7 @@ def save_scenario_plot(
     summary = scenario_summary(records, nodes, config)
     fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
     ax_lux, ax_duty, ax_lux_bar, ax_duty_bar = axes.ravel()
-    title = config.name if config is not None else records[0].scenario
+    title = scenario_display_name(config) if config is not None else records[0].scenario
     fig.suptitle(f"Controller test: {title}", fontsize=14)
 
     for idx, node in enumerate(nodes):
@@ -1118,9 +1151,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", help="Serial port, e.g. COM11")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--timeout", type=float, default=0.2)
-    parser.add_argument("--algo", type=int, default=0, choices=[0, 1, 2], help="0=PRIMAL_DUAL, 1=ADMM, 2=CONSENSUS")
+    parser.add_argument("--algo", type=int, default=1, choices=[0, 1, 2], help="0=PRIMAL_DUAL, 1=ADMM, 2=CONSENSUS")
     parser.add_argument("--feedback", type=int, default=1, choices=[0, 1])
-    parser.add_argument("--refs", default="1.0,2.0,1.0", help="Comma-separated refs for nodes 1..N")
+    parser.add_argument("--refs", default="20.0,20.0,20.0", help="Comma-separated refs for nodes 1..N")
     parser.add_argument("--equal-costs", default="1,1,1", help="Comma-separated costs for equal-cost scenario")
     parser.add_argument("--weighted-costs", default="1,3,8", help="Comma-separated costs for weighted scenario")
     parser.add_argument("--monitor-seconds", type=float, default=15.0)
@@ -1128,6 +1161,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reply-window", type=float, default=0.30)
     parser.add_argument("--delay", type=float, default=0.20)
     parser.add_argument("--settle-seconds", type=float, default=3.0, help="Wait after setup before sampling")
+    parser.add_argument("--skip-calibration", action="store_true", help="Skip the automatic fresh calibration before testing")
+    parser.add_argument("--calibration-seconds", type=float, default=9.0, help="How long to wait for the calibration FSM before starting tests")
     parser.add_argument("--skip-baseline", action="store_true", help="Skip the local PID baseline")
     parser.add_argument("--skip-weighted", action="store_true", help="Run only the equal-cost scenario")
     parser.add_argument("--no-plots", action="store_true", help="Skip PNG/HTML graph generation")
@@ -1177,7 +1212,9 @@ def main() -> None:
     if args.plot_csv:
         prefix = prefix or Path(args.plot_csv).stem
     else:
-        prefix = prefix or datetime.now().strftime("controller_test_%Y%m%d_%H%M%S")
+        prefix = prefix or datetime.now().strftime(
+            f"controller_test_%Y%m%d_%H%M%S_{algorithm_name(args.algo)}"
+        )
     csv_path = out_dir / f"{prefix}.csv"
 
     scenario_configs = {
@@ -1210,6 +1247,7 @@ def main() -> None:
             ) from SERIAL_IMPORT_ERROR
 
         print(f"Opening {args.port} @ {args.baud}...")
+        print(f"Distributed algorithm: {algorithm_name(args.algo)}")
         with serial.Serial(args.port, args.baud, timeout=args.timeout) as ser:
             time.sleep(1.0)
             nodes = discover_nodes(ser, args.reply_window)
@@ -1220,6 +1258,9 @@ def main() -> None:
                 print("Warning: expected nodes [1, 2, 3]. Continuing with discovered nodes.")
             if len(nodes) != 3:
                 raise SystemExit("This script expects exactly 3 nodes for the current firmware.")
+
+            if not args.skip_calibration:
+                run_calibration(ser, args.calibration_seconds, args.reply_window, args.delay)
 
             baseline_summary: Optional[Dict[int, Dict[str, float]]] = None
             if not args.skip_baseline:
@@ -1308,10 +1349,16 @@ def main() -> None:
             print(f"Saved plot: {path}")
 
     print("\nWhat you want to see:")
+    if not args.plot_csv and not args.skip_calibration:
+        print("- These results include a fresh calibration taken immediately before the test.")
     print("- Lux values close to each node reference, especially in the last 40% of samples.")
     print("- Duty not stuck at 1.0 all the time; otherwise the test is saturated.")
-    print("- With equal costs, stronger nodes may naturally carry more load.")
-    print("- With weighted costs, expensive nodes should tend to reduce duty if the target is achievable.")
+    if args.algo == 1:
+        print("- With ADMM, the duties should settle instead of jumping violently between samples.")
+        print("- With weighted costs, expensive nodes should tend to back off if the calibrated model is sane.")
+    else:
+        print("- With equal costs, stronger nodes may naturally carry more load.")
+        print("- With weighted costs, expensive nodes should tend to reduce duty if the target is achievable.")
 
 
 if __name__ == "__main__":

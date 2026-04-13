@@ -73,6 +73,12 @@ private:
     float y_ij_;
     float y_ik_;
     float rho_admm_;
+    float admm_self_step_;
+    float admm_copy_step_;
+    float admm_violation_gain_;
+    float admm_max_self_delta_;
+    float admm_max_copy_delta_;
+    bool admm_initialized_;
 
     float my_gradient_estimate_;
     float previous_local_gradient_;

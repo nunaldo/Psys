@@ -38,6 +38,16 @@ NeighborData neighborNodeB;
 
 CalibrationFSM calibration(gainMatrix);
 
+constexpr unsigned long DIST_OPTIMIZATION_PERIOD_US = 100000;
+constexpr unsigned long DIST_BROADCAST_PERIOD_US = 50000;
+constexpr float DIST_OUTPUT_BLEND = 0.20f;
+constexpr float DIST_OUTPUT_MAX_STEP = 0.01f;
+
+static float distributedTargetDuty = 0.0f;
+static float distributedAuxCache = 0.0f;
+static unsigned long lastDistributedOptimizationUs = 0;
+static unsigned long lastDistributedBroadcastUs = 0;
+
 void WriteCorezeroone(CoreMail localCopy) {
     if (!queue_try_add(&xQueue0to1, &localCopy)) {
         Serial.println("Queue Full!");
@@ -71,6 +81,35 @@ void calSend(uint8_t cmd, uint8_t target, float data) {
 
 void setDuty(float d) {
     u_ff = d * 4095.0f;
+}
+
+static float clampUnitValue(float value) {
+    if (value > 1.0f) {
+        return 1.0f;
+    }
+    if (value < 0.0f) {
+        return 0.0f;
+    }
+    return value;
+}
+
+static float moveDutyToward(float current, float target) {
+    const float blended = current + (DIST_OUTPUT_BLEND * (target - current));
+    const float delta = blended - current;
+    if (delta > DIST_OUTPUT_MAX_STEP) {
+        return clampUnitValue(current + DIST_OUTPUT_MAX_STEP);
+    }
+    if (delta < -DIST_OUTPUT_MAX_STEP) {
+        return clampUnitValue(current - DIST_OUTPUT_MAX_STEP);
+    }
+    return clampUnitValue(blended);
+}
+
+static void resetDistributedLoopState() {
+    distributedTargetDuty = dutyCycle;
+    distributedAuxCache = 0.0f;
+    lastDistributedOptimizationUs = 0;
+    lastDistributedBroadcastUs = 0;
 }
 
 static uint8_t controllerIndexFromNodeId(uint8_t node_id) {
@@ -129,6 +168,7 @@ static void applyCalibrationParameter(uint8_t packed_info, float value) {
 
 void shareCalibrationParameter(uint8_t row_index, uint8_t parameter_index, float value) {
     const uint8_t packed_info = (uint8_t)((row_index << 4) | (parameter_index & 0x0F));
+    applyCalibrationParameter(packed_info, value);
     for (uint8_t target = 1; target <= N_NODES; ++target) {
         if (target == MY_NODE_ID) {
             continue;
@@ -242,13 +282,17 @@ void handleRequest(CoreMail mail) {
             const int mode = (int)data;
             if (mode == 0) {
                 currentState = FF;
+                resetDistributedLoopState();
                 response = 1.0f;
             } else if (mode == 1) {
                 currentState = PID_STATE;
+                resetDistributedLoopState();
                 response = 1.0f;
             } else if (mode == 2) {
                 currentState = DIST_STATE;
+                distributedController.setAlgorithm(distributedController.getAlgorithm());
                 syncDistributedController();
+                resetDistributedLoopState();
                 response = 1.0f;
             } else {
                 response = 0.0f;
@@ -264,6 +308,7 @@ void handleRequest(CoreMail mail) {
             const int algo = (int)data;
             if (algo >= (int)PRIMAL_DUAL && algo <= (int)CONSENSUS) {
                 distributedController.setAlgorithm((DistributedAlgorithm)algo);
+                resetDistributedLoopState();
                 response = 1.0f;
             } else {
                 response = 0.0f;
@@ -284,6 +329,7 @@ void handleRequest(CoreMail mail) {
                 response = 0.0f;
                 break;
             }
+            resetDistributedLoopState();
             calibration.begin();
             response = 1.0f;
             break;
@@ -400,10 +446,22 @@ void loop() {
                 break;
 
             case DIST_STATE: {
-                const float dutyUnit = distributedController.runControlCycle(neighborNodeA, neighborNodeB, lux);
-                u = dutyUnit * 4095.0f;
-                aux_to_broadcast = distributedController.getAuxiliaryData();
-                broadcast_state = true;
+                if ((lastDistributedOptimizationUs == 0) ||
+                    ((t_now - lastDistributedOptimizationUs) >= DIST_OPTIMIZATION_PERIOD_US)) {
+                    distributedTargetDuty = distributedController.runControlCycle(neighborNodeA, neighborNodeB, lux);
+                    distributedAuxCache = distributedController.getAuxiliaryData();
+                    lastDistributedOptimizationUs = t_now;
+                }
+
+                const float appliedDuty = moveDutyToward(dutyCycle, distributedTargetDuty);
+                u = appliedDuty * 4095.0f;
+
+                if ((lastDistributedBroadcastUs == 0) ||
+                    ((t_now - lastDistributedBroadcastUs) >= DIST_BROADCAST_PERIOD_US)) {
+                    aux_to_broadcast = distributedAuxCache;
+                    broadcast_state = true;
+                    lastDistributedBroadcastUs = t_now;
+                }
                 break;
             }
         }
@@ -415,7 +473,9 @@ void loop() {
     {
         const uint8_t my_idx = controllerIndexFromNodeId((uint8_t)MY_NODE_ID);
         distributedNodeData[my_idx].u = dutyCycle;
-        if (!broadcast_state) {
+        if (currentState == DIST_STATE) {
+            distributedNodeData[my_idx].auxiliary = distributedAuxCache;
+        } else if (!broadcast_state) {
             distributedNodeData[my_idx].auxiliary = 0.0f;
         }
     }

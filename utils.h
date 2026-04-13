@@ -22,12 +22,14 @@
 #define MAX_RLDR 20e6f
 #define ALPHA    0.2f
 
-#define M  -0.8f
-#define B 6.08f   // COM8
-//#define B 5.16f   // COM11
+//#define M  -0.8f //COM11
+//#define B 6.16f   // COM11 
 
-//#define M -0.88f // COM6
-//#define B 6.75f // COM6
+#define B 7.08f  // COM8 
+#define M -1.08f 
+
+//#define M -1.07f // COM6
+//#define B 6.93f // COM6
 
 // ── Plant model ───────────────────────────────────────────────────────────────
 // #define K_PLANT  27.0f

@@ -15,6 +15,18 @@ float computeExpectedLux(float self_k,
            baseline;
 }
 
+float limitStep(float current, float candidate, float max_delta) {
+    const float upper = current + max_delta;
+    const float lower = current - max_delta;
+    if (candidate > upper) {
+        return upper;
+    }
+    if (candidate < lower) {
+        return lower;
+    }
+    return candidate;
+}
+
 }  // namespace
 
 SuperController::SuperController(uint8_t id,
@@ -46,7 +58,13 @@ SuperController::SuperController(uint8_t id,
       copy_u_k_(0.0f),
       y_ij_(0.0f),
       y_ik_(0.0f),
-      rho_admm_(0.05f),
+      rho_admm_(0.02f),
+      admm_self_step_(0.003f),
+      admm_copy_step_(0.005f),
+      admm_violation_gain_(0.08f),
+      admm_max_self_delta_(0.02f),
+      admm_max_copy_delta_(0.03f),
+      admm_initialized_(false),
       my_gradient_estimate_(0.0f),
       previous_local_gradient_(0.0f),
       consensus_step_(0.002f),
@@ -105,6 +123,9 @@ float SuperController::getDutyCycle() const {
 float SuperController::getAuxiliaryData() const {
     if (current_algo_ == PRIMAL_DUAL) {
         return my_lambda_;
+    }
+    if (current_algo_ == ADMM) {
+        return 0.5f * (y_ij_ + y_ik_);
     }
     if (current_algo_ == CONSENSUS) {
         return my_gradient_estimate_;
@@ -229,6 +250,7 @@ void SuperController::resetOptimizationState() {
     copy_u_k_ = 0.0f;
     y_ij_ = 0.0f;
     y_ik_ = 0.0f;
+    admm_initialized_ = false;
     my_gradient_estimate_ = 0.0f;
     previous_local_gradient_ = 0.0f;
     consensus_initialized_ = false;
@@ -250,21 +272,76 @@ void SuperController::runPrimalDual(const NeighborData& node_j, const NeighborDa
 }
 
 void SuperController::runADMM(const NeighborData& node_j, const NeighborData& node_k) {
+    // ADMM local model:
+    // - keep the global decision u_i on this node
+    // - keep local copies of the neighbors' duties
+    // - penalize local visibility violation with the calibrated coupling model
+    // - enforce copy_j = u_j and copy_k = u_k with scaled-dual ADMM updates
+    if (!admm_initialized_) {
+        copy_u_j_ = node_j.u;
+        copy_u_k_ = node_k.u;
+        admm_initialized_ = true;
+    }
+
+    const float estimated_l = computeExpectedLux(
+        selfGain(),
+        gainFromNeighborJ(),
+        gainFromNeighborK(),
+        feedforward_u_,
+        copy_u_j_,
+        copy_u_k_,
+        d0_i_);
+    const float lux_error = my_L_ref_ - estimated_l;
+    const float deadband = 0.35f;
+
+    float under_error = 0.0f;
+    float over_error = 0.0f;
+    if (lux_error > deadband) {
+        under_error = lux_error - deadband;
+    } else if (lux_error < -deadband) {
+        over_error = (-lux_error) - deadband;
+    }
+
+    float gradient_u = my_cost_ + (0.02f * feedforward_u_);
+    float gradient_copy_j = y_ij_ + rho_admm_ * (copy_u_j_ - node_j.u);
+    float gradient_copy_k = y_ik_ + rho_admm_ * (copy_u_k_ - node_k.u);
+
+    if (under_error > 0.0f) {
+        const float penalty_scale = admm_violation_gain_ * under_error;
+        gradient_u -= penalty_scale * selfGain();
+        gradient_copy_j -= penalty_scale * gainFromNeighborJ();
+        gradient_copy_k -= penalty_scale * gainFromNeighborK();
+    } else if (over_error > 0.0f) {
+        const float penalty_scale = 0.5f * admm_violation_gain_ * over_error;
+        gradient_u += penalty_scale * selfGain();
+        gradient_copy_j += penalty_scale * gainFromNeighborJ();
+        gradient_copy_k += penalty_scale * gainFromNeighborK();
+    } else {
+        // Hold the operating point inside a small lux band to avoid visible
+        // 0/1 chatter caused by model error and asynchronous neighbor updates.
+        gradient_u = 0.0f;
+    }
+
+    const float next_u = clampUnit(feedforward_u_ - (admm_self_step_ * gradient_u));
+    const float next_copy_j = clampUnit(copy_u_j_ - (admm_copy_step_ * gradient_copy_j));
+    const float next_copy_k = clampUnit(copy_u_k_ - (admm_copy_step_ * gradient_copy_k));
+
+    feedforward_u_ = limitStep(feedforward_u_, next_u, admm_max_self_delta_);
+    copy_u_j_ = limitStep(copy_u_j_, next_copy_j, admm_max_copy_delta_);
+    copy_u_k_ = limitStep(copy_u_k_, next_copy_k, admm_max_copy_delta_);
+
     y_ij_ += rho_admm_ * (copy_u_j_ - node_j.u);
     y_ik_ += rho_admm_ * (copy_u_k_ - node_k.u);
-
-    const float residual_j = copy_u_j_ - node_j.u;
-    const float residual_k = copy_u_k_ - node_k.u;
-
-    const float gradient_u = my_cost_ +
-                             rho_admm_ * (feedforward_u_ - copy_u_j_) +
-                             rho_admm_ * (feedforward_u_ - copy_u_k_);
-    const float gradient_copy_j = y_ij_ + rho_admm_ * residual_j;
-    const float gradient_copy_k = y_ik_ + rho_admm_ * residual_k;
-
-    feedforward_u_ = clampUnit(feedforward_u_ - (0.01f * gradient_u));
-    copy_u_j_ = clampUnit(copy_u_j_ - (0.01f * gradient_copy_j));
-    copy_u_k_ = clampUnit(copy_u_k_ - (0.01f * gradient_copy_k));
+    if (y_ij_ > 0.5f) {
+        y_ij_ = 0.5f;
+    } else if (y_ij_ < -0.5f) {
+        y_ij_ = -0.5f;
+    }
+    if (y_ik_ > 0.5f) {
+        y_ik_ = 0.5f;
+    } else if (y_ik_ < -0.5f) {
+        y_ik_ = -0.5f;
+    }
 }
 
 void SuperController::runConsensus(const NeighborData& node_j, const NeighborData& node_k) {
